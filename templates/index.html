@@ -1,0 +1,520 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Gobblet Game</title>
+    <style>
+        body {
+            font-family: 'Arial', sans-serif;
+            margin: 0;
+            padding: 20px;
+            background-color: #f5f5f5;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+        }
+        .game-container {
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            gap: 20px;
+            max-width: 800px;
+            width: 100%;
+        }
+        .game-info {
+            width: 100%;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+        }
+        .current-player {
+            font-size: 24px;
+            font-weight: bold;
+            padding: 10px;
+            border-radius: 5px;
+            transition: background-color 0.3s;
+        }
+        .player1 { color: #e74c3c; background-color: #fadbd8; }
+        .player2 { color: #3498db; background-color: #d4e6f1; }
+
+        .board {
+            display: grid;
+            grid-template-columns: repeat(4, 80px);
+            grid-template-rows: repeat(4, 80px);
+            gap: 5px;
+            background-color: #34495e;
+            padding: 10px;
+            border-radius: 5px;
+        }
+        .cell {
+            background-color: #ecf0f1;
+            border-radius: 5px;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            cursor: pointer;
+            position: relative;
+        }
+        .cell:hover {
+            background-color: #e0e0e0;
+        }
+
+        .stacks-container {
+            display: flex;
+            justify-content: space-between;
+            width: 100%;
+        }
+        .player-stacks {
+            display: flex;
+            gap: 10px;
+        }
+        .stack {
+            width: 80px;
+            height: 180px;
+            background-color: #ecf0f1;
+            border-radius: 5px;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            padding: 10px 0;
+            cursor: pointer;
+        }
+        .stack:hover {
+            background-color: #e0e0e0;
+        }
+
+        .piece {
+            border-radius: 50%;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            color: white;
+            font-weight: bold;
+            margin: 2px 0;
+            position: relative;
+            transition: transform 0.3s;
+        }
+        .player1-piece {
+            background-color: #e74c3c;
+        }
+        .player2-piece {
+            background-color: #3498db;
+        }
+        .size-1 { width: 30px; height: 30px; font-size: 12px; }
+        .size-2 { width: 40px; height: 40px; font-size: 14px; }
+        .size-3 { width: 50px; height: 50px; font-size: 16px; }
+        .size-4 { width: 60px; height: 60px; font-size: 18px; }
+
+        .piece.selected {
+            box-shadow: 0 0 10px 3px yellow;
+        }
+        .cell.valid-target {
+            background-color: #aaffaa;
+        }
+
+        .game-message {
+            font-size: 24px;
+            margin-top: 20px;
+            padding: 10px 20px;
+            border-radius: 5px;
+            background-color: #2ecc71;
+            color: white;
+            opacity: 0;
+            transition: opacity 0.5s;
+        }
+        .game-message.show {
+            opacity: 1;
+        }
+
+        .buttons-container {
+            display: flex;
+            gap: 10px;
+            margin-top: 20px;
+        }
+
+        button {
+            padding: 10px 20px;
+            background-color: #3498db;
+            color: white;
+            border: none;
+            border-radius: 5px;
+            cursor: pointer;
+            font-size: 16px;
+        }
+        button:hover {
+            background-color: #2980b9;
+        }
+
+        button.bot-move {
+            background-color: #2ecc71;
+        }
+        button.bot-move:hover {
+            background-color: #27ae60;
+        }
+    </style>
+</head>
+<body>
+    <div class="game-container">
+        <h1>Gobblet Game</h1>
+
+        <div class="game-info">
+            <div class="current-player player1">Player 1's Turn</div>
+            <div id="game-message" class="game-message"></div>
+            <div class="buttons-container">
+                <button id="reset-button">New Game</button>
+                <button id="bot-game" class="bot-game">Play vs. Bot</button>
+                <button id="bot-move" class="bot-move">Bot Move</button>
+            </div>
+        </div>
+
+        <div class="stacks-container">
+            <div class="player-stacks" id="player1-stacks">
+                <div class="stack" data-player="1" data-stack="0"></div>
+                <div class="stack" data-player="1" data-stack="1"></div>
+                <div class="stack" data-player="1" data-stack="2"></div>
+            </div>
+
+            <div class="player-stacks" id="player2-stacks">
+                <div class="stack" data-player="2" data-stack="0"></div>
+                <div class="stack" data-player="2" data-stack="1"></div>
+                <div class="stack" data-player="2" data-stack="2"></div>
+            </div>
+        </div>
+
+        <div class="board" id="game-board">
+            <!-- Board cells will be generated by JavaScript -->
+        </div>
+    </div>
+
+    <script>
+        // Global state
+        let selectedSource = null;
+        let selectedPiece = null;
+
+        // UI Elements
+        const gameBoard = document.getElementById('game-board');
+        const player1Stacks = document.getElementById('player1-stacks');
+        const player2Stacks = document.getElementById('player2-stacks');
+        const currentPlayerDisplay = document.querySelector('.current-player');
+        const gameMessage = document.getElementById('game-message');
+        const resetButton = document.getElementById('reset-button');
+        const botMoveButton = document.getElementById('bot-move');
+
+        document.getElementById('bot-game').addEventListener('click', async function () {
+            try {
+                const response = await fetch('/api/new-game', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ vsBot: true })
+                });
+
+                if (!response.ok) {
+                    throw new Error('Failed to start bot game');
+                }
+
+                const gameState = await response.json();
+                renderGameState(gameState);
+                clearSelection();
+            } catch (error) {
+                console.error('Error starting bot game:', error);
+            }
+        });
+
+
+        // Initialize the board
+        function initializeBoard() {
+            gameBoard.innerHTML = '';
+            for (let row = 0; row < 4; row++) {
+                for (let col = 0; col < 4; col++) {
+                    const cell = document.createElement('div');
+                    cell.className = 'cell';
+                    cell.dataset.row = row;
+                    cell.dataset.col = col;
+                    gameBoard.appendChild(cell);
+                }
+            }
+        }
+
+        // API calls
+        async function startNewGame() {
+            try {
+                const response = await fetch('/api/new-game', {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json',
+                    }
+                });
+
+                if (!response.ok) {
+                    throw new Error('Failed to start new game');
+                }
+
+                const gameState = await response.json();
+                renderGameState(gameState);
+                clearSelection();
+            } catch (error) {
+                console.error('Error starting new game:', error);
+            }
+        }
+
+        async function getGameState() {
+            try {
+                const response = await fetch('/api/game-state');
+
+                if (!response.ok) {
+                    throw new Error('Failed to get game state');
+                }
+
+                const gameState = await response.json();
+                renderGameState(gameState);
+            } catch (error) {
+                console.error('Error getting game state:', error);
+            }
+        }
+
+        async function makeMove(sourceType, sourceIdx, targetX, targetY) {
+            console.log("Move request:", sourceType, sourceIdx, targetX, targetY);  // Debugging line
+            try {
+                const response = await fetch('/api/make-move', {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json',
+                    },
+                    body: JSON.stringify({
+                        sourceType,
+                        sourceIdx,
+                        targetX,
+                        targetY,
+                        vsBot: true  // Add this to let the server know it's a bot game
+                    })
+                });
+
+                if (!response.ok) {
+                    throw new Error('Failed to make move');
+                }
+
+                const gameState = await response.json();
+                renderGameState(gameState);
+                clearSelection();
+            } catch (error) {
+                console.error('Error making move:', error);
+            }
+        }
+
+        async function getValidMoves(sourceType, sourceIdx) {
+            try {
+                const response = await fetch('/api/valid-moves', {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json',
+                    },
+                    body: JSON.stringify({
+                        sourceType,
+                        sourceIdx
+                    })
+                });
+
+                if (!response.ok) {
+                    throw new Error('Failed to get valid moves');
+                }
+
+                const data = await response.json();
+                return data.validMoves;
+            } catch (error) {
+                console.error('Error getting valid moves:', error);
+                return [];
+            }
+        }
+
+        async function makeBotMove() {
+            try {
+                const response = await fetch('/api/bot-move', {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json',
+                    }
+                });
+
+                if (!response.ok) {
+                    throw new Error('Failed to make bot move');
+                }
+
+                const gameState = await response.json();
+                renderGameState(gameState);
+            } catch (error) {
+                console.error('Error making bot move:', error);
+            }
+        }
+
+        // Render functions
+        function renderGameState(gameState) {
+            // Update current player
+            currentPlayerDisplay.className = `current-player player${gameState.currentPlayer}`;
+            currentPlayerDisplay.textContent = `Player ${gameState.currentPlayer}'s Turn`;
+
+            // Render board
+            for (let row = 0; row < 4; row++) {
+                for (let col = 0; col < 4; col++) {
+                    const cell = gameBoard.querySelector(`[data-row="${row}"][data-col="${col}"]`);
+                    cell.innerHTML = '';
+
+                    // Add all pieces in the cell (not just the top one)
+                    const pieces = gameState.board[row][col];
+                    if (pieces.length > 0) {
+                        pieces.forEach((piece, index) => {
+                            const pieceElement = createPieceElement(piece);
+                            if (index < pieces.length - 1) {
+                                pieceElement.style.opacity = "0.5"; // Hidden pieces are semi-transparent
+                                pieceElement.style.transform = `scale(${0.8 - index * 0.1})`; // Smaller size for hidden pieces
+                            }
+                            cell.appendChild(pieceElement);
+                        });
+                    }
+                }
+            }
+
+            // Render stacks
+            for (let player = 1; player <= 2; player++) {
+                for (let stackIdx = 0; stackIdx < 3; stackIdx++) {
+                    const stackElement = document.querySelector(`.stack[data-player="${player}"][data-stack="${stackIdx}"]`);
+                    stackElement.innerHTML = '';
+
+                    // Add pieces to the stack
+                    const pieces = gameState.players[player][stackIdx];
+                    pieces.forEach(piece => {
+                        const pieceElement = createPieceElement(piece);
+                        stackElement.appendChild(pieceElement);
+                    });
+                }
+            }
+
+            // Check for winner
+            if (gameState.winner) {
+                gameMessage.textContent = `Player ${gameState.winner} wins!`;
+                gameMessage.className = 'game-message show';
+            } else {
+                gameMessage.className = 'game-message';
+            }
+        }
+
+        // Create a piece element
+        function createPieceElement(piece) {
+            const pieceElement = document.createElement('div');
+            pieceElement.className = `piece player${piece.player}-piece size-${piece.size}`;
+            pieceElement.dataset.player = piece.player;
+            pieceElement.dataset.size = piece.size;
+            pieceElement.textContent = piece.size;
+            return pieceElement;
+        }
+
+        // Clear selection
+        function clearSelection() {
+            selectedSource = null;
+            selectedPiece = null;
+            document.querySelectorAll('.piece.selected').forEach(el => el.classList.remove('selected'));
+            document.querySelectorAll('.cell.valid-target').forEach(el => el.classList.remove('valid-target'));
+        }
+
+        // Handle clicking on a piece
+        async function handlePieceSelection(event) {
+            clearSelection();
+
+            let selectedElement = event.target;
+
+            // If clicking on a stack
+            if (selectedElement.classList.contains('stack')) {
+                const player = parseInt(selectedElement.dataset.player);
+                const stackIdx = parseInt(selectedElement.dataset.stack);
+
+                // Check if the stack has pieces
+                const pieceElement = selectedElement.querySelector('.piece');
+                if (!pieceElement) return;  // Empty stack
+
+                selectedSource = 'stack';
+                selectedPiece = stackIdx;
+
+                // Add visual selection to the top piece
+                if (pieceElement) pieceElement.classList.add('selected');
+
+                // Highlight valid move targets
+                const validMoves = await getValidMoves('stack', stackIdx);
+                validMoves.forEach(([x, y]) => {
+                    const cell = gameBoard.querySelector(`[data-row="${x}"][data-col="${y}"]`);
+                    cell.classList.add('valid-target');
+                });
+            }
+            // If clicking on a piece on the board
+            else if (selectedElement.classList.contains('piece')) {
+                // Find which cell contains this piece
+                const cell = selectedElement.closest('.cell');
+                const row = parseInt(cell.dataset.row);
+                const col = parseInt(cell.dataset.col);
+
+                selectedSource = 'board';
+                selectedPiece = [row, col];
+
+                // Add visual selection
+                selectedElement.classList.add('selected');
+
+                // Highlight valid move targets
+                const validMoves = await getValidMoves('board', [row, col]);
+                validMoves.forEach(([x, y]) => {
+                    const cell = gameBoard.querySelector(`[data-row="${x}"][data-col="${y}"]`);
+                    cell.classList.add('valid-target');
+                });
+            }
+        }
+
+        // Handle clicking on a cell
+        function handleCellClick(event) {
+            if (selectedPiece === null || selectedPiece === undefined) return;
+
+            const cell = event.target.closest('.cell');
+            if (!cell) return;
+
+            const row = parseInt(cell.dataset.row);
+            const col = parseInt(cell.dataset.col);
+            console.log("Trying to make move from", selectedSource, "with index", selectedPiece);
+            if (selectedPiece === 0) {
+                console.log("selectedPiece is 0! Is it being ignored?");
+            }
+
+            // If this is a valid target, make the move
+            if (cell.classList.contains('valid-target')) {
+                makeMove(selectedSource, selectedPiece, row, col);
+            }
+        }
+
+        // Event listeners
+        function addEventListeners() {
+            // Piece selection
+            player1Stacks.addEventListener('click', handlePieceSelection);
+            player2Stacks.addEventListener('click', handlePieceSelection);
+            gameBoard.addEventListener('click', event => {
+                if (event.target.classList.contains('piece')) {
+                    handlePieceSelection(event);
+                } else {
+                    handleCellClick(event);
+                }
+            });
+
+            // Reset button
+            resetButton.addEventListener('click', startNewGame);
+
+            // Bot move button
+            botMoveButton.addEventListener('click', makeBotMove);
+        }
+
+        // Initialize the game
+        function init() {
+            initializeBoard();
+            getGameState();
+            addEventListeners();
+        }
+
+        // Start the game
+        init();
+    </script>
+</body>
+</html>
