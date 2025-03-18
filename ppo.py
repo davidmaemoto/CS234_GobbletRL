@@ -8,380 +8,421 @@ import torch.nn.functional as F
 import torch.optim as optim
 from collections import deque
 import csv
-from gobblet_game import GobbletGame
+from gobblet_game import GobbletGame, RandomBot, HueristicMDPBot
 
 class PPONetwork(nn.Module):
-    def __init__(self, state_dim, action_dim=288, hidden_dim=256):
+    def __init__(self, state_dim, action_dim=288, hidden_dim=512):
         super(PPONetwork, self).__init__()
-        # Input layer with layer normalization
-        self.fc1 = nn.Linear(state_dim, hidden_dim)
-        self.ln1 = nn.LayerNorm(hidden_dim)
         
-        # Hidden layers with layer normalization
-        self.fc2 = nn.Linear(hidden_dim, hidden_dim)
-        self.ln2 = nn.LayerNorm(hidden_dim)
+        self.input_net = nn.Sequential(
+            nn.Linear(state_dim, hidden_dim),
+            nn.LayerNorm(hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.LayerNorm(hidden_dim),
+            nn.ReLU()
+        )
         
-        self.fc3 = nn.Linear(hidden_dim, hidden_dim)
-        self.ln3 = nn.LayerNorm(hidden_dim)
+        self.board_net = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.LayerNorm(hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.LayerNorm(hidden_dim),
+            nn.ReLU()
+        )
         
-        # Separate heads for policy and value
-        # Policy head outputs logits for each possible action
-        self.actor = nn.Linear(hidden_dim, action_dim)
+        self.policy_net = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.LayerNorm(hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, action_dim)
+        )
         
-        # Value head for state value estimation
-        self.critic = nn.Linear(hidden_dim, 1)
+        self.value_net = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim // 2),
+            nn.LayerNorm(hidden_dim // 2),
+            nn.ReLU(),
+            nn.Linear(hidden_dim // 2, 1)
+        )
         
-        # Initialize weights
         self._init_weights()
-    
+
+    @staticmethod
+    def init_layer(layer, std=np.sqrt(2), bias_const=0.0):
+        torch.nn.init.orthogonal_(layer.weight, std)
+        torch.nn.init.constant_(layer.bias, bias_const)
+
     def _init_weights(self):
-        """Initialize weights using orthogonal initialization"""
-        for module in [self.fc1, self.fc2, self.fc3, self.actor, self.critic]:
-            nn.init.orthogonal_(module.weight, gain=np.sqrt(2))
-            nn.init.constant_(module.bias, 0)
+        for module in self.modules():
+            if isinstance(module, nn.Linear):
+                self.init_layer(module)
+        
+        self.init_layer(self.policy_net[-1], std=0.01)
+        self.init_layer(self.value_net[-1], std=1.0)
         
     def forward(self, x):
-        # Forward pass through shared layers with layer normalization and residual connections
-        h1 = F.relu(self.ln1(self.fc1(x)))
-        h2 = F.relu(self.ln2(self.fc2(h1))) + h1
-        h3 = F.relu(self.ln3(self.fc3(h2))) + h2
-        
-        # Policy head
-        policy_logits = self.actor(h3)
-        
-        # Value head
-        value = self.critic(h3)
-        
+        x = self.input_net(x)
+        board_features = self.board_net(x)
+        policy_logits = self.policy_net(board_features)
+        value = self.value_net(board_features)
         return policy_logits, value
 
 class PPOBot:
-    def __init__(self, player_id, state_dim=89, action_dim=288, hidden_dim=256, lr=3e-5, gamma=0.99, epsilon=0.2, c1=0.5, c2=0.01):
-        """
-        :param player_id: Bot's player number (1 or 2)
-        :param state_dim: Dimension of flattened state vector (89 for Gobblet)
-        :param action_dim: Dimension of action vector (288 for full action space)
-        :param hidden_dim: Hidden layer size (increased for more capacity)
-        :param lr: Learning rate (reduced for stability)
-        :param gamma: Discount factor
-        :param epsilon: PPO clipping parameter
-        :param c1: Value loss coefficient
-        :param c2: Entropy coefficient for exploration
-        """
+    def __init__(self, player_id, state_dim=89, action_dim=288, hidden_dim=512, lr=3e-4, gamma=0.995, kl=0.02,
+                 gae=0.97, clip=0.3, norm=1.0, vf=1.0, ent=0.01):
         self.player_id = player_id
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         
-        # Initialize networks with larger capacity
         self.policy = PPONetwork(state_dim, action_dim, hidden_dim).to(self.device)
         self.policy_old = PPONetwork(state_dim, action_dim, hidden_dim).to(self.device)
         self.policy_old.load_state_dict(self.policy.state_dict())
+        self.optimizer = optim.Adam(self.policy.parameters(), lr=lr, eps=1e-5)
         
-        # Use AdamW optimizer with weight decay for regularization
-        self.optimizer = optim.AdamW(
-            self.policy.parameters(),
-            lr=lr,
-            eps=1e-5,
-            weight_decay=1e-4,
-            betas=(0.9, 0.999)
-        )
-        
-        # Learning rate scheduler for adaptive learning
-        self.scheduler = optim.lr_scheduler.ReduceLROnPlateau(
-            self.optimizer,
-            mode='min',
-            factor=0.5,
-            patience=5,
-            verbose=True
-        )
-        
-        # PPO hyperparameters
         self.gamma = gamma
-        self.epsilon = epsilon
-        self.c1 = c1
-        self.c2 = c2
+        self.kl = kl
+        self.gae = gae
+        self.clip = clip
+        self.norm = norm
+        self.vf = vf
+        self.ent = ent
+        self.beta = 0.5
+
+        self.trajs = []
+
+        self.action_map = self._idx_to_action()
         
-        # Memory with increased capacity
-        self.memory = deque(maxlen=2000)
-        
-        # Action space mapping
-        self.action_map = self._create_action_map()
-        
-    def _create_action_map(self):
-        """Create a mapping between action indices and game moves"""
+    def _idx_to_action(self):
         action_map = {}
         idx = 0
         
-        # Board to board moves (16x15=240 possible moves)
         for sx in range(4):
             for sy in range(4):
                 for tx in range(4):
                     for ty in range(4):
-                        if (sx, sy) != (tx, ty):  # Exclude same position moves
+                        if (sx, sy) != (tx, ty):
                             action_map[idx] = ("board", (sx, sy), tx, ty)
                             idx += 1
-                        
-        # Stack to board moves (3x16=48 possible moves)
-        for stack in range(3):  # 3 stacks
-            for tx in range(4):  # 4x4 board
+        for stack in range(3):
+            for tx in range(4):
                 for ty in range(4):
                     action_map[idx] = ("stack", stack, tx, ty)
                     idx += 1
                     
-        # Verify we have exactly 288 moves
-        assert len(action_map) == 288, f"Expected 288 moves, got {len(action_map)}"
-        # Verify we have all indices from 0 to 287
-        assert all(i in action_map for i in range(288)), "Missing some action indices"
+        assert len(action_map) == 288, f"Wrong number of actions"
+        assert all(i in action_map for i in range(288)), "Wrong number of actions 2"
         
         return action_map
         
     def _move_to_index(self, move):
-        """Convert a move to its corresponding index in the action space"""
         source_type, source_idx, tx, ty = move
         
         if source_type == "board":
             sx, sy = source_idx
             if sx == tx and sy == ty:
-                return None  # Invalid move
-            # Calculate index for board moves
-            # First calculate base index for the source position
-            base = sx * 60 + sy * 15  # Each source position can move to 15 other positions
-            # Then add offset for target position
-            target_offset = tx * 4 + ty
-            # Adjust for the skipped same-position move
-            if target_offset >= sx * 4 + sy:
-                target_offset -= 1
-            return base + target_offset
-        else:  # stack move
+                return None
+            base = sx * 60 + sy * 15
+            off = tx * 4 + ty
+            if off >= sx * 4 + sy:
+                off -= 1
+            return base + off
+        else:
             stack_num = source_idx
-            # Stack moves start after all board moves (240 board moves)
             return 240 + stack_num * 16 + tx * 4 + ty
             
     def _index_to_move(self, index):
-        """Convert an action index to a game move"""
-        if index not in self.action_map:
-            raise ValueError(f"Invalid action index: {index}")
         return self.action_map[index]
 
-    def select_move(self, game_state):
-        """Select a move using the current policy"""
+    def compute_gae(self, rewards, values, next_value):
+        advantages = torch.zeros_like(rewards)
+        last_gae = 0
+        
+        for t in reversed(range(len(rewards))):
+            next_val = next_value if t == len(rewards) - 1 else values[t + 1]
+            delta = rewards[t] + self.gamma * next_val - values[t]
+            advantages[t] = last_gae = delta + self.gamma * self.gae * last_gae
+
+        return (advantages - advantages.mean()) / (advantages.std() + 1e-8), advantages + values
+
+    def train_on_episode(self, trajectories):
+        if not trajectories:
+            return
+
+        states = torch.FloatTensor([t['state'] for t in trajectories]).to(self.device)
+        acts_idxs = torch.LongTensor([t['action_idx'] for t in trajectories]).to(self.device)
+        old_ps = torch.FloatTensor([t['prob'] for t in trajectories]).to(self.device)
+        rs = torch.FloatTensor([t['reward'] for t in trajectories]).to(self.device)
+        
+        with torch.no_grad():
+            _, values = self.policy_old(states)
+            values = values.squeeze()
+            if len(trajectories) > 1:
+                next_state = torch.FloatTensor([trajectories[-1]['state']]).to(self.device)
+                _, next_value = self.policy_old(next_state)
+                next_value = next_value.squeeze()
+            else:
+                next_value = values[-1]
+
+        advantages, returns = self.compute_gae(rs, values, next_value)
+        
+        batch_size = len(trajectories)
+        mini_batch_size = min(64, batch_size)
+        num_epochs = 8
+        best_loss = float('inf')
+        no_improvement_count = 0
+        
+        for epoch in range(num_epochs):
+            epoch_policy_loss = 0
+            epoch_value_loss = 0
+            epoch_ent = 0
+            num_minibatches = 0
+            
+            indices = torch.randperm(batch_size)
+            
+            for start_idx in range(0, batch_size, mini_batch_size):
+                batch_indices = indices[start_idx:start_idx + mini_batch_size]
+                
+                mb_states = states[batch_indices]
+                mb_actions = acts_idxs[batch_indices]
+                mb_old_probs = old_ps[batch_indices]
+                mb_advantages = advantages[batch_indices]
+                mb_returns = returns[batch_indices]
+                
+                policy_logits, current_values = self.policy(mb_states)
+                current_values = current_values.squeeze()
+                
+                probs = F.softmax(policy_logits, dim=-1)
+                current_probs = probs.gather(1, mb_actions.unsqueeze(1)).squeeze()
+                
+                ratio = torch.exp(torch.log(current_probs + 1e-10) - torch.log(mb_old_probs + 1e-10))
+                ratio = torch.clamp(ratio, 0.0, 10.0)
+                
+                policy_loss = -torch.min(
+                    ratio * mb_advantages,
+                    torch.clamp(ratio, 1 - self.clip, 1 + self.clip) * mb_advantages
+                ).mean()
+                
+                value_pred_clipped = values[batch_indices] + torch.clamp(
+                    current_values - values[batch_indices],
+                    -self.clip, self.clip
+                )
+                value_loss = torch.max(
+                    F.mse_loss(current_values, mb_returns),
+                    F.mse_loss(value_pred_clipped, mb_returns)
+                )
+                
+                entropy = -torch.sum(probs * torch.log(probs + 1e-10), dim=-1).mean()
+                
+                with torch.no_grad():
+                    old_logits, _ = self.policy_old(mb_states)
+                    old_probs_full = F.softmax(old_logits, dim=-1)
+                
+                kl_div = F.kl_div(F.log_softmax(policy_logits, dim=-1), old_probs_full, reduction='batchmean')
+                loss = (policy_loss + self.vf * value_loss - self.ent * (entropy + 1e-8).sqrt() + self.beta * kl_div)
+                
+                if torch.isnan(loss) or torch.isinf(loss):
+                    continue
+                
+                self.optimizer.zero_grad()
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(self.policy.parameters(), self.norm)
+                self.optimizer.step()
+                
+                epoch_policy_loss += policy_loss.item()
+                epoch_value_loss += value_loss.item()
+                epoch_ent += entropy.item()
+                num_minibatches += 1
+                
+                if kl_div > 4 * self.kl:
+                    break
+            
+            if num_minibatches > 0:
+                avg_loss = (epoch_policy_loss + epoch_value_loss) / num_minibatches
+                if avg_loss < best_loss:
+                    best_loss = avg_loss
+                    no_improvement_count = 0
+                else:
+                    no_improvement_count += 1
+                    if no_improvement_count >= 3:
+                        break
+            
+            if kl_div >= 1.5 * self.kl:
+                self.beta *= 1.5
+            elif kl_div <= self.kl / 1.5:
+                self.beta /= 1.5
+            
+            self.beta = torch.clamp(torch.tensor(self.beta), 0.1, 10.0).item()
+
+        self.policy_old.load_state_dict(self.policy.state_dict())
+        self.trajs.clear()
+
+    def collect_trajectory(self, game_state, bot_type):
         legal_moves = game_state.get_legal_moves()
         if not legal_moves:
             return None
 
-        # Vectorize state
         state = self._vectorize_state(game_state)
-        state_tensor = torch.FloatTensor(state).unsqueeze(0).to(self.device)
+        s_tensor = torch.FloatTensor(state).unsqueeze(0).to(self.device)
         
-        # Get policy logits and value
         with torch.no_grad():
-            policy_logits, value = self.policy_old(state_tensor)
+            policy_logits, value = self.policy(s_tensor)
             
-        # Convert legal moves to action indices
-        legal_indices = []
-        for move in legal_moves:
-            idx = self._move_to_index(move)
-            if idx is not None:
-                legal_indices.append(idx)
+        legal_indices = [self._move_to_index(move) for move in legal_moves if self._move_to_index(move) is not None]
         
-        # Create mask for legal moves
         action_mask = torch.zeros(288, dtype=torch.bool)
         action_mask[legal_indices] = True
         
-        # Apply mask and get probabilities
         logits = policy_logits.squeeze()
-        logits[~action_mask] = float('-inf')  # Mask illegal moves
+        logits[~action_mask] = float('-inf')
         probs = F.softmax(logits, dim=0)
         
-        # Sample move using probabilities
         try:
             move_idx = torch.multinomial(probs, 1).item()
             chosen_move = self._index_to_move(move_idx)
             prob = probs[move_idx].item()
         except RuntimeError:
-            # Fallback to random selection if sampling fails
             move_idx = random.choice(legal_indices)
             chosen_move = self._index_to_move(move_idx)
             prob = 1.0 / len(legal_indices)
         
-        # Store transition with action index instead of move vector
-        self.memory.append({
-            'state': state,
-            'action_idx': move_idx,
-            'prob': prob,
-            'value': value.item()
-        })
-        
+        if bot_type == "ppo":
+            self.trajs.append({
+                'state': state,
+                'action_idx': move_idx,
+                'prob': prob,
+                'value': value.item()
+            })
         return chosen_move
 
-    def train_on_episode(self, transitions):
-        """Update policy using PPO"""
-        if not transitions:
-            return
-            
-        # Convert transitions to tensors
-        states = torch.FloatTensor([t['state'] for t in transitions]).to(self.device)
-        action_indices = torch.LongTensor([t['action_idx'] for t in transitions]).to(self.device)
-        old_probs = torch.FloatTensor([t['prob'] for t in transitions]).to(self.device)
-        rewards = torch.FloatTensor([t['reward'] for t in transitions]).to(self.device)
-        
-        # Normalize rewards
-        rewards = (rewards - rewards.mean()) / (rewards.std() + 1e-8)
-        
-        # Compute value targets and advantages
-        with torch.no_grad():
-            _, values = self.policy(states)
-            values = values.squeeze()
-            advantages = rewards - values
-            advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
-        
-        # PPO update
-        for _ in range(3):  # Reduced number of epochs for stability
-            # Get current policy and value predictions
-            policy_logits, current_values = self.policy(states)
-            
-            # Calculate action probabilities
-            probs = F.softmax(policy_logits, dim=-1)
-            current_probs = probs.gather(1, action_indices.unsqueeze(1)).squeeze()
-            
-            # Calculate probability ratio
-            ratio = current_probs / (old_probs + 1e-10)
-            ratio = torch.clamp(ratio, 0.0, 10.0)
-            
-            # Calculate surrogate losses
-            surr1 = ratio * advantages
-            surr2 = torch.clamp(ratio, 1 - self.epsilon, 1 + self.epsilon) * advantages
-            policy_loss = -torch.min(surr1, surr2).mean()
-            
-            # Value loss using Huber loss for robustness
-            value_loss = F.smooth_l1_loss(current_values.squeeze(), rewards)
-            
-            # Entropy loss for exploration
-            entropy = -(probs * torch.log(probs + 1e-10)).sum(dim=-1).mean()
-            
-            # Total loss
-            loss = policy_loss + self.c1 * value_loss - self.c2 * entropy
-            
-            # Skip update if loss is invalid
-            if torch.isnan(loss) or torch.isinf(loss):
-                continue
-            
-            # Optimize
-            self.optimizer.zero_grad()
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(self.policy.parameters(), max_norm=0.5)
-            self.optimizer.step()
-            
-            # Update learning rate based on loss
-            self.scheduler.step(loss)
-        
-        # Update old policy
-        self.policy_old.load_state_dict(self.policy.state_dict())
-        self.memory.clear()
-
     def _vectorize_state(self, game_state):
-        """Convert game state to vector format"""
         state_vec = []
-        
-        # Current player indicator
         state_vec.append([1 if game_state.current_player == 1 else -1])
-        
-        # Add board and stack vectors
         state_vec.extend(self._vectorize_board_and_stacks(game_state))
-        
         return np.concatenate(state_vec)
         
     def _vectorize_board_and_stacks(self, game_state):
-        """Helper method to vectorize board and stacks"""
         state_vec = []
-        
-        # Player 1 stacks
         for stack in game_state.players[1]:
             stack_vector = self._stack_to_vector(stack)
             state_vec.append(stack_vector)
-            
-        # Player 2 stacks
         for stack in game_state.players[2]:
             stack_vector = self._stack_to_vector(stack)
             state_vec.append(stack_vector)
-            
-        # Board
         for row in range(4):
             for col in range(4):
                 cell_vector = self._cell_to_vector(game_state.board[row][col])
                 state_vec.append(cell_vector)
-                
         return state_vec
         
     def _stack_to_vector(self, stack):
-        """Convert a stack to vector representation"""
         vec = [0, 0, 0, 0]
         for idx, piece in enumerate(stack):
-            multiplier = 1 if piece.player == 1 else -1
-            vec[idx] = multiplier * piece.size
+            vec[idx] = piece.size if piece.player == 1 else -1 * piece.size
         return vec
         
     def _cell_to_vector(self, cell):
-        """Convert a cell to vector representation"""
         vec = [0, 0, 0, 0]
         for idx, piece in enumerate(cell):
-            multiplier = 1 if piece.player == 1 else -1
-            vec[idx] = multiplier * piece.size
+            vec[idx] = piece.size if piece.player == 1 else -1 * piece.size
         return vec
         
     def _vectorize_move(self, move):
-        """Convert a move to vector format"""
-        source_type, source_idx, tx, ty = move
-        if source_type == "stack":
-            return [source_idx, -1, tx, ty]  # 4-dimensional vector
+        move_type, stack_num, x, y = move
+        if move_type == "stack":
+            return [move_type, -1, x, y]
         else:
-            sx, sy = source_idx
-            return [sx, sy, tx, ty]  # 4-dimensional vector
+            from_x, from_y = stack_num
+            return [from_x, from_y, x, y]
             
     def _compute_returns(self, rewards):
-        """Compute discounted returns"""
         returns = torch.zeros_like(rewards)
-        running_return = 0
-        
+        r2 = 0
         for t in reversed(range(len(rewards))):
-            running_return = rewards[t] + self.gamma * running_return
-            returns[t] = running_return
-            
+            r2 = rewards[t] + self.gamma * r2
+            returns[t] = r2
         return returns
         
-    def compute_reward(self, old_game_state, new_game_state, action):
-        """Compute reward for a state transition"""
+    def compute_reward(self, old_state, new_state, action):
         reward = 0.0
 
-        # Win/loss rewards
-        winner = new_game_state.check_winner()
-        if winner:
-            return 10.0 if winner == self.player_id else -10.0
-            
-        # Capture reward
-        reward += self._check_capture(old_game_state, new_game_state, action)
+        opponent_id = 3 - self.player_id
+        can_opponent_win = self._can_win_in_one_move(new_state, opponent_id)
+        if can_opponent_win:
+            return -10000.0
 
-        # Threat-based rewards
-        reward += self._count_threats(new_game_state, self.player_id)
-        reward += self._count_blocked_threats(old_game_state, new_game_state, self.player_id)
-        reward -= self._count_threats(new_game_state, 3 - self.player_id) * 0.5
+        could_opponent_win = self._can_win_in_one_move(old_state, opponent_id)
+        if could_opponent_win and not can_opponent_win:
+            reward += 100.0
+        
+        winner = new_state.check_winner()
+        if winner:
+            return 10000000.0 if winner == self.player_id else -10000000.0
+        
+        center_positions = [(1,1), (1,2), (2,1), (2,2)]
+        center_control = 0
+        for x, y in center_positions:
+            cell = new_state.board[x][y]
+            if cell and cell[-1].player == self.player_id:
+                center_control += 1
+        reward += 0.5 * center_control
+        
+        lines = self._get_all_lines(new_state)
+        threat_value = 0
+        for line in lines:
+            my_pieces = sum(1 for cell in line if cell and cell[-1].player == self.player_id)
+            opp_pieces = sum(1 for cell in line if cell and cell[-1].player != self.player_id)
+            if my_pieces == 2 and opp_pieces == 0:
+                threat_value += 2.0
+            elif my_pieces == 3:
+                threat_value += 5.0
+        reward += threat_value
+        
+        opp_threat_value = 0
+        for line in lines:
+            opp_pieces = sum(1 for cell in line if cell and cell[-1].player != self.player_id)
+            my_pieces = sum(1 for cell in line if cell and cell[-1].player == self.player_id)
+            if opp_pieces == 2 and my_pieces == 0:
+                opp_threat_value += 2.0
+            elif opp_pieces == 3:
+                opp_threat_value += 5.0
+        reward -= opp_threat_value
+
+        move_type, from_pos, x, y = action
+        if move_type == "stack":
+            piece_size = len(old_state.players[self.player_id][from_pos])
+            reward += 0.2 * piece_size
+
+            target_cell = old_state.board[x][y]
+            if target_cell and target_cell[-1].player != self.player_id:
+                reward += 0.5 * piece_size
 
         return reward
 
-    def _check_capture(self, old_state, new_state, action):
-        """Check if a move resulted in capturing an opponent's piece"""
-        _, _, tx, ty = action
-        before_stack = old_state.board[tx][ty]
-        after_stack = new_state.board[tx][ty]
+    def _can_win_in_one_move(self, state, player_id):
+        original_player = state.current_player
+        state.current_player = player_id
+        legal_moves = state.get_legal_moves()
+        state.current_player = original_player
 
+        for move in legal_moves:
+            test_state = deepcopy(state)
+            test_state.current_player = player_id
+            if test_state.make_move(move):
+                if test_state.check_winner() == player_id:
+                    return True
+        return False
+
+    def _check_capture(self, old_state, new_state, action):
+        _, _, x, y = action
+        before_stack = old_state.board[x][y]
+        after_stack = new_state.board[x][y]
         if len(before_stack) < len(after_stack):
             if before_stack and before_stack[-1].player != self.player_id:
                 return 1.0
         return 0.0
 
     def _count_threats(self, game_state, player):
-        """Count the number of threatening positions"""
         threat_value = 0.0
-        
-        # Get all lines (rows, columns, diagonals)
         lines = self._get_all_lines(game_state)
         
         for line in lines:
@@ -395,282 +436,88 @@ class PPOBot:
         return threat_value
         
     def _count_blocked_threats(self, old_game, new_game, player):
-        """Compute reward for blocking opponent threats"""
         opponent = 3 - player
-        old_threats = self._count_threats(old_game, opponent)
-        new_threats = self._count_threats(new_game, opponent)
-        
-        if new_threats < old_threats:
-            return (old_threats - new_threats) * 0.5
+        old = self._count_threats(old_game, opponent)
+        new = self._count_threats(new_game, opponent)
+        diff = old - new
+        if new < old:
+            return diff * 0.5
         return 0.0
         
     def _get_all_lines(self, game_state):
-        """Get all possible lines (rows, columns, diagonals)"""
         board = game_state.board
         lines = []
-        
-        # Rows
         for r in range(4):
             lines.append([board[r][c] for c in range(4)])
-            
-        # Columns
         for c in range(4):
             lines.append([board[r][c] for r in range(4)])
-            
-        # Diagonals
         lines.append([board[i][i] for i in range(4)])
         lines.append([board[i][3-i] for i in range(4)])
-        
         return lines
         
     def save_model(self, path):
-        """Save the policy network"""
         torch.save(self.policy.state_dict(), path)
         
     def load_model(self, path):
-        """Load a saved policy network"""
         self.policy.load_state_dict(torch.load(path))
         self.policy_old.load_state_dict(self.policy.state_dict())   
 
-        
-    def train_from_data(self, data_path, num_epochs=5, batch_size=32):
-        """Train PPO bot using historical game data"""
-        print("Starting training from historical data...")
-        
-        # Load and preprocess data
-        transitions = load_training_data(data_path)
-        if not transitions:
-            return
-            
-        # Convert moves to action indices
-        processed_transitions = []
-        for t in transitions:
-            action = t['action']
-            if action['source_type'] == 'board':
-                tx, ty = action['target']
-                move = ('board', action['source_idx'], tx, ty)
-            else:
-                tx, ty = action['target']
-                move = ('stack', action['source_idx'], tx, ty)
-            idx = self._move_to_index(move)
-            if idx is not None:
-                t['action_idx'] = idx
-                processed_transitions.append(t)
-        
-        # Convert to tensors
-        states = torch.FloatTensor([t['state'] for t in processed_transitions]).to(self.device)
-        action_indices = torch.LongTensor([t['action_idx'] for t in processed_transitions]).to(self.device)
-        rewards = torch.FloatTensor([t['reward'] for t in processed_transitions]).to(self.device)
-        
-        # Remove any NaN values
-        valid_mask = ~torch.isnan(rewards) & ~torch.isnan(states).any(dim=1)
-        states = states[valid_mask]
-        action_indices = action_indices[valid_mask]
-        rewards = rewards[valid_mask]
-        
-        # Normalize rewards
-        rewards = torch.clamp(rewards, -10.0, 10.0)
-        rewards = (rewards - rewards.mean()) / (rewards.std() + 1e-8)
-        
-        dataset_size = len(states)
-        indices = list(range(dataset_size))
-        best_loss = float('inf')
-        patience = 5
-        no_improvement = 0
-        
-        for epoch in range(num_epochs):
-            random.shuffle(indices)
-            total_loss = 0
-            num_batches = 0
-            
-            for start_idx in range(0, dataset_size, batch_size):
-                batch_indices = indices[start_idx:min(start_idx + batch_size, dataset_size)]
-                
-                batch_states = states[batch_indices]
-                batch_actions = action_indices[batch_indices]
-                batch_rewards = rewards[batch_indices]
-                
-                try:
-                    # Get policy predictions
-                    policy_logits, values = self.policy(batch_states)
-                    
-                    # Calculate action probabilities
-                    probs = F.softmax(policy_logits, dim=-1)
-                    chosen_probs = probs.gather(1, batch_actions.unsqueeze(1)).squeeze()
-                    
-                    # Get old policy predictions
-                    with torch.no_grad():
-                        old_logits, _ = self.policy_old(batch_states)
-                        old_probs = F.softmax(old_logits, dim=-1)
-                        old_chosen_probs = old_probs.gather(1, batch_actions.unsqueeze(1)).squeeze()
-                    
-                    # Calculate advantages
-                    advantages = batch_rewards - values.squeeze()
-                    advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
-                    
-                    # Calculate probability ratio
-                    ratio = chosen_probs / (old_chosen_probs + 1e-10)
-                    ratio = torch.clamp(ratio, 0.0, 10.0)
-                    
-                    # Calculate losses
-                    surr1 = ratio * advantages
-                    surr2 = torch.clamp(ratio, 1 - self.epsilon, 1 + self.epsilon) * advantages
-                    policy_loss = -torch.min(surr1, surr2).mean()
-                    
-                    value_loss = F.smooth_l1_loss(values.squeeze(), batch_rewards)
-                    entropy = -(probs * torch.log(probs + 1e-10)).sum(dim=-1).mean()
-                    
-                    loss = policy_loss + self.c1 * value_loss - self.c2 * entropy
-                    
-                    if torch.isnan(loss) or torch.isinf(loss):
-                        continue
-                    
-                    # Optimize
-                    self.optimizer.zero_grad()
-                    loss.backward()
-                    torch.nn.utils.clip_grad_norm_(self.policy.parameters(), max_norm=0.5)
-                    self.optimizer.step()
-                    
-                    total_loss += loss.item()
-                    num_batches += 1
-                    
-                except RuntimeError as e:
-                    print(f"Warning: {str(e)}")
-                    continue
-            
-            if num_batches > 0:
-                avg_loss = total_loss / num_batches
-                print(f"Epoch {epoch + 1}/{num_epochs} - Average Loss: {avg_loss:.4f}")
-                
-                # Early stopping check
-                if avg_loss < best_loss:
-                    best_loss = avg_loss
-                    no_improvement = 0
-                else:
-                    no_improvement += 1
-                    if no_improvement >= patience:
-                        print("Early stopping triggered!")
-                        break
-            
-            # Update old policy
-            self.policy_old.load_state_dict(self.policy.state_dict())
-            
-            # Update learning rate
-            self.scheduler.step(avg_loss)
-        
-        print("Training complete!")
-
-def load_training_data(file_path):
-    """Load training data from CSV file containing (s,a,r,s') tuples"""
-    print(f"Loading training data from {file_path}...")
-    
-    data = []
-    with open(file_path, mode='r') as f:
-        reader = csv.reader(f)
-        for row in reader:
-            # Convert strings to floats
-            row = [float(x) for x in row]
-            
-            # Extract components
-            state = row[:89]  # First 89 elements are the state vector
-            move_vec = row[89:94]  # 5 elements: [source_type, source_x, source_y, target_x, target_y]
-            reward = row[94]  # Reward
-            next_state = row[95:184]  # Next state vector
-            
-            # Convert move vector to action format
-            source_type = 'board' if move_vec[0] == 0 else 'stack'
-            if source_type == 'board':
-                source_idx = (int(move_vec[1]), int(move_vec[2]))
-            else:
-                source_idx = int(move_vec[1])
-            target = (int(move_vec[3]), int(move_vec[4]))
-            
-            data.append({
-                'state': state,
-                'action': {
-                    'source_type': source_type,
-                    'source_idx': source_idx,
-                    'target': target
-                },
-                'reward': reward,
-                'next_state': next_state
-            })
-    
-    print(f"Loaded {len(data)} transitions")
-    return data
-
-def simulate_and_train(ppo_bot, opponent_bot, num_games=100, save_path=None, learn = True):
-    """Train PPO bot against any opponent bot"""
-    print(f"Starting self-play training against {opponent_bot.__class__.__name__}...")
-    
-    # Track wins for statistics
+def simulate_and_train(ppo_bot, opponent_bot, num_games=100, save_path=None):
     wins = {1: 0, 2: 0}
-    
     for game_idx in range(num_games):
         game = GobbletGame()
-        game_memory = []
+        trajectories = []
         moves_made = 0
         
         while True:
             current_player = game.current_player
-            current_bot = ppo_bot if current_player == 1 else opponent_bot
-            
-            # Get current state before move
             old_state = game.get_game_state()
             
-            # Get move from appropriate bot
-            move = current_bot.select_move(old_state)
+            if current_player == 1:
+                move = ppo_bot.collect_trajectory(old_state, "ppo")
+            else:
+                if isinstance(opponent_bot, RandomBot):
+                    move = opponent_bot.select_move(old_state)
+                elif isinstance(opponent_bot, HueristicMDPBot):
+                    move = opponent_bot.select_move(old_state)
+                else:
+                    move = ppo_bot.collect_trajectory(old_state, "opponent")
             if not move:
                 break
                 
-            # Make the move
             success = game.make_move(move)
             moves_made += 1
             
-            if success and current_player == 1:  # Only store PPO bot's moves
-                # Calculate immediate reward
+            if success and current_player == 1:
                 reward = ppo_bot.compute_reward(old_state, game, move)
                 
-                # Store transition if it's in memory
-                if len(ppo_bot.memory) > 0:
-                    game_memory.append({
-                        'transitions': list(ppo_bot.memory),
-                        'reward': reward
-                    })
+                if len(ppo_bot.trajs) > 0:
+                    ppo_bot.trajs[-1]['reward'] = reward
+                    trajectories.append(ppo_bot.trajs[-1])
             
-            # Check for game end
             winner = game.check_winner()
             if winner:
                 wins[winner] += 1
-                # Update final rewards based on game outcome
                 final_reward = 10.0 if winner == 1 else -10.0
-                for mem in game_memory:
-                    for t in mem['transitions']:
+                for t in trajectories:
                         t['reward'] = final_reward
                 break
             
-            # If game is too long, end it with a small negative reward
             if moves_made > 200:
-                for mem in game_memory:
-                    for t in mem['transitions']:
+                for t in trajectories:
                         t['reward'] = -1.0
                 break
             
-        if learn:
-            # Train PPO bot on collected experience
-            for mem in game_memory:
-                ppo_bot.train_on_episode(mem['transitions'])
+        if trajectories:
+            ppo_bot.train_on_episode(trajectories)
         
-        # Print progress and statistics
         if (game_idx + 1) % 10 == 0:
             win_rate = wins[1] / (game_idx + 1) * 100
-            print(f"Game {game_idx + 1}/{num_games} - Win Rate: {win_rate:.1f}% (PPO: {wins[1]}, Opponent: {wins[2]})")
+            print(f"G {game_idx + 1}/{num_games} - W%: {win_rate:.1f}% (Ppo: {wins[1]}, Opp: {wins[2]})")
     
-    # Save the trained model
     if save_path:
-        print(f"Saving model to {save_path}")
         ppo_bot.save_model(save_path)
     
     final_win_rate = wins[1] / num_games * 100
-    print(f"\nTraining complete! Final win rate: {final_win_rate:.1f}%")
-    print(f"Total wins - PPO: {wins[1]}, Opponent: {wins[2]}")
+    print(f"\n{final_win_rate:.1f}%")
+    print(f"Ws - PPO: {wins[1]}, Opp: {wins[2]}")
